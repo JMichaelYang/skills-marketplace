@@ -10,6 +10,7 @@ import time
 
 FAILED_CONCLUSIONS = {"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE", "ERROR"}
 VIEW_FIELDS = "state,mergeable,reviews,comments,statusCheckRollup"
+MAX_BACKOFF = 300
 
 
 def gh(*args):
@@ -73,10 +74,7 @@ def save(path, state):
     os.replace(tmp, path)
 
 
-def poll(issue, path):
-    pr = find_pr(issue)
-    if pr is None:
-        return []
+def poll(pr, path):
     view = gh("pr", "view", str(pr), "--json", VIEW_FIELDS)
     state = load(path)
     baseline = state is None or state.get("pr") != pr
@@ -112,19 +110,26 @@ def main():
     parser = argparse.ArgumentParser(description="Wait for new events on an issue's PR.")
     parser.add_argument("issue", type=int)
     parser.add_argument("state_dir")
-    parser.add_argument("--interval", type=float, default=60, help="seconds between polls (default 60)")
+    parser.add_argument("--interval", type=float, default=15, help="seconds between polls (default 15)")
     args = parser.parse_args()
     if args.interval <= 0:
         parser.error("--interval must be positive")
     os.makedirs(args.state_dir, exist_ok=True)
     path = os.path.join(args.state_dir, f"watch-{args.issue}.json")
+    max_delay = max(MAX_BACKOFF, args.interval)
+    delay = args.interval
+    pr = None
     while True:
         try:
-            if poll(args.issue, path):
+            if pr is None:
+                pr = find_pr(args.issue)
+            if pr is not None and poll(pr, path):
                 return 0
+            delay = args.interval
         except (RuntimeError, json.JSONDecodeError) as e:
-            print(e, file=sys.stderr)
-        time.sleep(args.interval)
+            delay = min(delay * 2, max_delay)
+            print(f"{e}; retrying in {delay:g}s", file=sys.stderr)
+        time.sleep(delay)
 
 
 if __name__ == "__main__":
