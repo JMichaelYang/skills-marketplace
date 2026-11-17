@@ -5,9 +5,11 @@ import fcntl
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 STATUSES = ("waiting", "running", "pr_open", "merged", "cleaned")
 DONE = ("merged", "cleaned")
@@ -15,6 +17,8 @@ FIELDS = ("blockers", "session", "id", "status", "pr", "verify", "notes")
 APPENDABLE = ("blockers", "notes")
 RESERVED = ("locks.json",)
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+STAMP = "%Y-%m-%dT%H:%M:%SZ"
+MIN_STALE = 60
 BLOCKED_RE = re.compile(r"blocked by\s+((?:#\d+(?:\s*(?:,|and|&)\s*)?)+)", re.I)
 
 
@@ -100,7 +104,7 @@ def write(path, data):
 
 
 def now():
-    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.datetime.now(datetime.timezone.utc).strftime(STAMP)
 
 
 def update(path, event, change):
@@ -346,8 +350,20 @@ def queued(entry):
     return str(entry)
 
 
+def holding(lock):
+    holder, session = lock.get("holder"), lock.get("session")
+    who = str(holder or session or "free")
+    if holder and session and str(session) != str(holder):
+        who += f" ({session})"
+    return who
+
+
+def locks_path():
+    return os.path.join(state_dir(), "locks.json")
+
+
 def load_locks():
-    path = os.path.join(state_dir(), "locks.json")
+    path = locks_path()
     try:
         with open(path) as fh:
             return json.load(fh)
@@ -378,12 +394,153 @@ def cmd_show(args):
         print("|---|---|---|---|---|")
         for name in sorted(locks):
             lock = locks[name] or {}
-            holder, session = lock.get("holder"), lock.get("session")
-            who = str(holder or session or "free")
-            if holder and session and str(session) != str(holder):
-                who += f" ({session})"
             queue = ", ".join(queued(q) for q in lock.get("queue") or []) or "-"
-            print(f"| {cell(name)} | {cell(who)} | {cell(lock.get('since'))} | {cell(queue)} | {cell(lock.get('note'))} |")
+            print(f"| {cell(name)} | {cell(holding(lock))} | {cell(lock.get('since'))} | {cell(queue)} | {cell(lock.get('note'))} |")
+
+
+def check_lock(name):
+    if not NAME_RE.match(name):
+        raise Fail(f"invalid lock name: {name}")
+    return name
+
+
+def stamp(text):
+    try:
+        return datetime.datetime.strptime(text, STAMP).replace(tzinfo=datetime.timezone.utc).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def alive_sessions():
+    try:
+        out = subprocess.run(["claude", "agents", "--json"], capture_output=True, text=True, timeout=60)
+        agents = json.loads(out.stdout) if out.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        agents = None
+    if not isinstance(agents, list):
+        return None
+    return {str(a[k]) for a in agents if isinstance(a, dict) for k in ("name", "id", "sessionId") if a.get(k)}
+
+
+def log_lock(entry):
+    with open(os.path.join(state_dir(), "locks.log"), "a") as fh:
+        fh.write(json.dumps(dict(at=now(), **entry)) + "\n")
+
+
+def reap(name, lock, me, alive, max_hold, t):
+    held = lock.get("session")
+    if held and held != me:
+        if alive is not None and held not in alive:
+            reason = "missing from claude agents"
+        elif t - stamp(lock.get("since")) > max_hold:
+            reason = f"held past {max_hold / 60:g}m"
+        else:
+            reason = None
+        if reason:
+            log_lock({"lock": name, "event": "takeover", "from": held, "holder": lock.get("holder"), "by": me, "reason": reason})
+            print(f"took over {name} from {held}: {reason}", file=sys.stderr)
+            lock.update(holder=None, session=None, since=None, note=f"taken over from {held}: {reason}")
+    lock["queue"] = [
+        q for q in lock.get("queue") or []
+        if q.get("session") == me
+        or not (
+            (alive is not None and q.get("session") not in alive)
+            or t - stamp(q.get("seen")) > max(MIN_STALE, 3 * float(q.get("poll") or 0))
+        )
+    ]
+
+
+def leave(path, name, me):
+    with locked(path):
+        locks = load_locks()
+        lock = locks.get(name)
+        if lock:
+            lock["queue"] = [q for q in lock.get("queue") or [] if q.get("session") != me]
+            write(path, locks)
+
+
+def interrupt(signum, frame):
+    raise KeyboardInterrupt
+
+
+def cmd_lock_acquire(args):
+    name = check_lock(args.name)
+    if args.poll <= 0 or args.max_hold <= 0:
+        raise Fail("--poll and --max-hold must be positive")
+    path = locks_path()
+    me = args.session
+    issue = number(args.issue) if args.issue else None
+    signal.signal(signal.SIGTERM, interrupt)
+    try:
+        while True:
+            alive = alive_sessions()
+            with locked(path):
+                locks = load_locks()
+                lock = locks.setdefault(name, {"holder": None, "session": None, "since": None, "note": None, "queue": []})
+                reap(name, lock, me, alive, args.max_hold * 60, time.time())
+                queue = lock["queue"]
+                mine = next((q for q in queue if q.get("session") == me), None)
+                got = lock["session"] == me
+                if not got and lock["session"] is None and (not queue or queue[0] is mine):
+                    lock.update(holder=f"#{issue}" if issue else me, session=me, since=now())
+                    if mine:
+                        queue.remove(mine)
+                    got = True
+                elif not got and args.wait:
+                    if mine is None:
+                        mine = {"session": me, "issue": issue, "since": now()}
+                        queue.append(mine)
+                    mine.update(seen=now(), poll=args.poll)
+                write(path, locks)
+                state = dict(lock)
+            if got:
+                print(f"acquired {name}")
+                if state.get("note"):
+                    print(f"note: {state['note']}")
+                return
+            if not args.wait:
+                holder = holding(state) if state.get("session") else "the queue"
+                raise Fail(f"{name} is held by {holder}; pass --wait to queue")
+            time.sleep(args.poll)
+    except KeyboardInterrupt:
+        leave(path, name, me)
+        raise Fail(f"stopped waiting for {name}")
+
+
+def cmd_lock_release(args):
+    name = check_lock(args.name)
+    path = locks_path()
+    with locked(path):
+        locks = load_locks()
+        lock = locks.get(name)
+        if not lock:
+            raise Fail(f"no lock named {name}")
+        if lock.get("session") == args.session:
+            lock.update(holder=None, session=None, since=None, note=args.note or None)
+        else:
+            queue = lock.get("queue") or []
+            lock["queue"] = [q for q in queue if q.get("session") != args.session]
+            if len(lock["queue"]) == len(queue):
+                raise Fail(f"{args.session} does not hold {name}")
+        write(path, locks)
+
+
+def cmd_lock_status(args):
+    locks = load_locks()
+    names = [check_lock(args.name)] if args.name else sorted(locks)
+    t = time.time()
+    for name in names:
+        lock = locks.get(name)
+        if lock is None:
+            raise Fail(f"no lock named {name}")
+        if lock.get("session"):
+            print(f"{name}: held by {holding(lock)} since {lock.get('since')} ({(t - stamp(lock.get('since'))) / 60:.0f}m)")
+        else:
+            print(f"{name}: free")
+        if lock.get("note"):
+            print(f"  note: {lock['note']}")
+        if lock.get("queue"):
+            print("  queue: " + ", ".join(queued(q) for q in lock["queue"]))
 
 
 def parser():
@@ -410,6 +567,24 @@ def parser():
     s.set_defaults(func=cmd_unblocked)
     s = sub.add_parser("show", parents=[state], help="print the dependency chart, status table and locks")
     s.set_defaults(func=cmd_show)
+    s = sub.add_parser("lock", help="FIFO locks on shared devices, kept in locks.json")
+    ls = s.add_subparsers(dest="lock_cmd", required=True)
+    s = ls.add_parser("acquire", help="take a lock, or with --wait queue until it is yours")
+    s.add_argument("name")
+    s.add_argument("--session", required=True)
+    s.add_argument("--issue")
+    s.add_argument("--wait", action="store_true")
+    s.add_argument("--max-hold", type=float, default=30, metavar="MINUTES", help="take over a holder older than this (default 30)")
+    s.add_argument("--poll", type=float, default=10, metavar="SECONDS", help="seconds between checks while waiting (default 10)")
+    s.set_defaults(func=cmd_lock_acquire)
+    s = ls.add_parser("release", help="release a lock, or leave its queue")
+    s.add_argument("name")
+    s.add_argument("--session", required=True)
+    s.add_argument("--note", default="", help="one-line result for the next holder")
+    s.set_defaults(func=cmd_lock_release)
+    s = ls.add_parser("status", help="print holders, notes and queues")
+    s.add_argument("name", nargs="?")
+    s.set_defaults(func=cmd_lock_status)
     return p
 
 
