@@ -267,13 +267,123 @@ def cmd_get(args):
 
 def cmd_unblocked(args):
     issues = load(resolve(args.state))["issues"]
-    ready = [
-        int(k) for k, v in issues.items()
-        if v["status"] == "waiting"
-        and all(issues.get(str(b), {}).get("status") in DONE for b in v["blockers"])
-    ]
-    for n in sorted(ready):
+    for n in sorted(int(k) for k, v in issues.items() if is_ready(issues, v)):
         print(n)
+
+
+def is_ready(issues, v):
+    return v["status"] == "waiting" and all(
+        issues.get(str(b), {}).get("status") in DONE for b in v["blockers"]
+    )
+
+
+def label(issues, n):
+    v = issues[n]
+    text = f"#{n} {v.get('title', '')}".rstrip()
+    if v["status"] in DONE:
+        return f"{text} ✅"
+    if is_ready(issues, v):
+        return f"{text} ◄ ready"
+    return f"{text} ({v['status']})"
+
+
+def graph(issues):
+    keys = sorted(issues, key=int)
+    tracked = {k: [str(b) for b in issues[k]["blockers"] if str(b) in issues] for k in keys}
+    depth = {}
+
+    def level(k, seen=()):
+        if k not in depth:
+            parents = [p for p in tracked[k] if p not in seen]
+            depth[k] = 1 + max((level(p, seen + (k,)) for p in parents), default=-1)
+        return depth[k]
+
+    parent = {}
+    for k in keys:
+        if tracked[k]:
+            parent[k] = max(tracked[k], key=lambda p: (level(p), int(p)))
+    children = {k: [c for c in keys if parent.get(c) == k] for k in keys}
+    lines = []
+    placed = set()
+
+    def walk(k, prefix, branch, last, under=None):
+        placed.add(k)
+        others = [f"#{p}" for p in tracked[k] if p != under]
+        extra = f" ◄ {'also ' if under else ''}{', '.join(others)}" if others else ""
+        lines.append(prefix + branch + label(issues, k) + extra)
+        pad = prefix + ("" if not branch else "    " if last else "│   ")
+        kids = [c for c in children[k] if c not in placed]
+        for i, c in enumerate(kids):
+            end = i == len(kids) - 1
+            walk(c, pad, "└─► " if end else "├─► ", end, k)
+
+    for k in keys:
+        if k not in parent:
+            walk(k, "", "", True)
+    for k in keys:
+        if k not in placed:
+            walk(k, "", "", True)
+    return lines
+
+
+def cell(value):
+    if value is None or value == "":
+        return "-"
+    return str(value).replace("|", "\\|").replace("\n", " ")
+
+
+def pr_link(pr):
+    if pr is None or pr == "":
+        return "-"
+    pr = str(pr)
+    return f"#{pr}" if pr.isdigit() else cell(pr)
+
+
+def queued(entry):
+    if isinstance(entry, dict):
+        who = entry.get("session") or entry.get("holder") or "?"
+        return f"{who} (#{entry['issue']})" if entry.get("issue") else str(who)
+    return str(entry)
+
+
+def load_locks():
+    path = os.path.join(state_dir(), "locks.json")
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError as e:
+        raise Fail(f"cannot read {path}: {e}")
+
+
+def cmd_show(args):
+    data = load(resolve(args.state))
+    issues = data["issues"]
+    locks = load_locks()
+    print(f"Coordinator: {data.get('coordinator', '?')}")
+    print()
+    print("```")
+    print("\n".join(graph(issues)) if issues else "(no issues)")
+    print("```")
+    print()
+    print("| Issue | Session | Status | PR | Verify |")
+    print("|---|---|---|---|---|")
+    for k in sorted(issues, key=int):
+        v = issues[k]
+        print(f"| #{k} | {cell(v.get('session'))} | {cell(v['status'])} | {pr_link(v.get('pr'))} | {cell(v.get('verify'))} |")
+    if locks:
+        print()
+        print("| Lock | Holder | Since | Queue | Note |")
+        print("|---|---|---|---|---|")
+        for name in sorted(locks):
+            lock = locks[name] or {}
+            holder, session = lock.get("holder"), lock.get("session")
+            who = str(holder or session or "free")
+            if holder and session and str(session) != str(holder):
+                who += f" ({session})"
+            queue = ", ".join(queued(q) for q in lock.get("queue") or []) or "-"
+            print(f"| {cell(name)} | {cell(who)} | {cell(lock.get('since'))} | {cell(queue)} | {cell(lock.get('note'))} |")
 
 
 def parser():
@@ -298,6 +408,8 @@ def parser():
     s.set_defaults(func=cmd_get)
     s = sub.add_parser("unblocked", parents=[state], help="print waiting issues whose blockers merged")
     s.set_defaults(func=cmd_unblocked)
+    s = sub.add_parser("show", parents=[state], help="print the dependency chart, status table and locks")
+    s.set_defaults(func=cmd_show)
     return p
 
 
