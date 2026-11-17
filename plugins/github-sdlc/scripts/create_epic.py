@@ -9,6 +9,7 @@ import time
 
 PLACEHOLDER = re.compile(r"\{T(\d+)\}")
 BLOCKED = re.compile(r"Blocked by ([^\n]*)")
+REFS = re.compile(r"(?:\{T\d+\}|#\d+)(?:, (?:\{T\d+\}|#\d+))*\.")
 ISSUE_URL = re.compile(r"/issues/(\d+)\s*$")
 
 
@@ -34,6 +35,9 @@ def load_plan(path):
         labels = ticket.get("labels", [])
         if not isinstance(labels, list) or not all(isinstance(l, str) and l for l in labels):
             fail(f"T{i} labels must be a list of strings")
+        for line in BLOCKED.findall(ticket["body"]):
+            if not REFS.fullmatch(line.strip()):
+                fail(f"T{i} has 'Blocked by {line.strip()}'; list only {{T<k>}} or #N refs, comma-separated, ending in '.'")
         for k in map(int, PLACEHOLDER.findall(ticket["body"])):
             if not 1 <= k < i:
                 fail(f"T{i} references {{T{k}}}, which is not an earlier ticket")
