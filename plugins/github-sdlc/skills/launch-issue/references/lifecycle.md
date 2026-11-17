@@ -11,3 +11,4 @@ Your prompt gives the issue `<n>`, `Base`, `Coordinator`, `State`, the brief and
 1. Run `/github-sdlc:execute-issue <n> <brief>`, adding to its args: "Before pushing, run the rules' pre-push checks and fix any failures, then `git fetch origin && git rebase origin/<default>` and rerun the checks if the rebase changed anything."
 2. `state set <n> status=pr_open pr=<PR URL>`.
 3. SendMessage the coordinator once: `#<n> PR ready: <PR URL>`, one line on the change, and the checks run with their results.
+4. Run `/github-sdlc:handle-reviews <n> [--interval <seconds>] <rules>`, passing `--interval` only when the rules name a watch interval, and the rules unless they are "none". When it reports a thread needing the user's decision, SendMessage the coordinator `#<n> needs a decision: <link>` with the question, then keep watching. It returns the `merged` or `closed` line.
