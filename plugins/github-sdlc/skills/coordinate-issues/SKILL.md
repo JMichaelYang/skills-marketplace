@@ -13,14 +13,14 @@ Args: `<n>… [rules]`, where rules may name pre-push checks, a version-bump con
    - `git fetch origin`, then read the issue (`gh issue view <n> --json title,body,comments`), its `notes` from `state get <n>`, and the code it touches as merged on `origin/<default>` (`git show origin/<default>:<path>`, `git grep <pattern> origin/<default>`), never the working tree.
    - Write a brief: the approach with concrete paths, then `Overlaps:` naming each `running` or `pr_open` sibling, or one launched in this batch, that touches the same files, what it changes and how to stay clear of it (or `none`), then `Verify:` naming the surfaces and checks (e.g. `android: open Settings, toggle dark mode, confirm the header recolors`), or `none` when nothing user-visible changes.
    - Run `/github-sdlc:launch-issue <n> --state <name> <brief>` and tell the user its reply, or its output if it failed.
-3. Wait for messages. Message a session only with SendMessage to its `session` from `state get <n>`. Handle each:
+3. Wait for messages. Message a session only with SendMessage to its `session` from `state get <n>`. To remove a session, take its `id` from `state get <n>`, run `claude stop <id>` if `claude agents --json` still lists it, then `claude rm <id>`; if `rm` refuses, tell the user what it reported instead of passing its override flags. Handle each:
    - `#<n> PR ready: <url>` from a session: tell the user in one line with the URL, the change and the checks. Leave the session running; it handles its own reviews.
-   - `#<n> merged (PR #<m>), cleaned up, <default>@<sha>; now unblocked: …` from a session: confirm `state get <n>` shows `cleaned`, else ask the session to finish cleanup and wait for a new digest. Then run `claude stop <id>` with its `id`, tell the user, and do step 2; `state unblocked` overrides the digest's list.
-   - A report that `#<n>`'s PR closed without merging: confirm `gh pr view <pr> --json state` is `CLOSED`, run `claude stop <id>`, `state set <n> notes+="PR <pr> closed without merge"`, and ask the user whether to drop it or relaunch it (`state set <n> status=waiting pr=`, then step 2). Its dependents stay blocked.
+   - `#<n> merged (PR #<m>), cleaned up, <default>@<sha>; now unblocked: …` from a session: confirm `state get <n>` shows `cleaned`, else ask the session to finish cleanup and wait for a new digest. Then remove the session, tell the user, and do step 2; `state unblocked` overrides the digest's list.
+   - A report that `#<n>`'s PR closed without merging: confirm `gh pr view <pr> --json state` is `CLOSED`, remove the session, `state set <n> notes+="PR <pr> closed without merge"`, and ask the user whether to drop it or relaunch it (`state set <n> status=waiting pr=`, then step 2). Its dependents stay blocked.
    - A question from a session: answer it if the brief or rules settle it, else relay it to the user with its link and send back their answer.
    - The user changes a requirement for `#<n>`: `state set <n> notes+="<change>"`, and send it to the session if `#<n>` is `running` or `pr_open`.
    - The user adds issues: `state add <n>…`, then step 2.
    - The user asks for status: reply with `state show` as printed.
 
-   Run `claude stop` only in those two cases, never after PR ready or during review. Never merge, even when a session asks; the user merges.
+   Remove sessions only in those two cases, never after PR ready or during review. Never merge, even when a session asks; the user merges.
 4. When every issue is `cleaned` or dropped, reply with `state show` and end.
