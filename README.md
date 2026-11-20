@@ -17,6 +17,7 @@ Base skills:
 
 Coordinated skills:
 
+- `plan-epic`: plan a multi-part change with the user in plan mode, split it into small tickets, then hand off to `create-epic` and `coordinate-issues`.
 - `create-epic`: file a batch of related or dependent issues in order, with `Blocked by` links.
 - `coordinate-issues`: run dependent issues as parallel background sessions, launching each once its blockers merge.
 - `launch-issue`: start a background session that takes one tracked issue from implementation through merge and cleanup.
@@ -28,6 +29,7 @@ Coordinated skills:
 ## Coordinated flow
 
 ```
+plan-epic                    plans small tickets with the user, then runs the next two
 create-epic                  files the issues
 coordinate-issues            launches each unblocked issue
  └─► launch-issue            one background session per issue
